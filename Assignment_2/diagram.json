@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "author": "Francis Doll",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-breadboard-half",
+      "id": "bb1",
+      "top": 53.7,
+      "left": -111.9,
+      "rotate": 90,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-pi-pico",
+      "id": "pico",
+      "top": 16.05,
+      "left": -159.6,
+      "attrs": { "builder": "pico-sdk" }
+    },
+    {
+      "type": "wokwi-ntc-temperature-sensor",
+      "id": "ntc1",
+      "top": -7.5,
+      "left": 133.9,
+      "rotate": 90,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-pushbutton-6mm",
+      "id": "btn1",
+      "top": 65,
+      "left": 76.8,
+      "attrs": { "color": "green", "xray": "1" }
+    },
+    { "type": "chip-i2cspichip", "id": "chip3", "top": 145.02, "left": 177.6, "attrs": {} }
+  ],
+  "connections": [
+    [ "pico:GP0", "$serialMonitor:RX", "", [] ],
+    [ "pico:GP1", "$serialMonitor:TX", "", [] ],
+    [ "pico:VBUS", "bb1:bp.1", "red", [ "h0" ] ],
+    [ "pico:GND.8", "bb1:bn.3", "black", [ "h0" ] ],
+    [ "bb1:bp.2", "bb1:tp.2", "red", [ "h0" ] ],
+    [ "bb1:bn.4", "bb1:tn.4", "black", [ "h0" ] ],
+    [ "pico:GP16", "bb1:21b.j", "gold", [ "v0" ] ],
+    [ "pico:GP17", "bb1:20b.j", "#8f4814", [ "h0" ] ],
+    [ "pico:GP18", "bb1:18b.j", "orange", [ "h0" ] ],
+    [ "pico:GP19", "bb1:17b.j", "gold", [ "h0" ] ],
+    [ "pico:GP20", "bb1:16b.j", "blue", [ "h0" ] ],
+    [ "pico:GP21", "bb1:15b.j", "#8f4814", [ "h0" ] ],
+    [ "pico:GP28", "bb1:8t.e", "violet", [ "h0" ] ],
+    [ "btn1:1.l", "bb1:6t.d", "", [ "$bb" ] ],
+    [ "btn1:2.l", "bb1:8t.d", "", [ "$bb" ] ],
+    [ "btn1:1.r", "bb1:6t.a", "", [ "$bb" ] ],
+    [ "btn1:2.r", "bb1:8t.a", "", [ "$bb" ] ],
+    [ "pico:3V3", "bb1:6t.e", "red", [ "h0" ] ],
+    [ "ntc1:OUT", "bb1:11t.a", "blue", [ "v0" ] ],
+    [ "ntc1:GND", "bb1:tp.11", "black", [ "v0" ] ],
+    [ "ntc1:VCC", "bb1:tp.10", "red", [ "v0" ] ],
+    [ "chip3:GND", "bb1:tn.16", "black", [ "h0" ] ],
+    [ "chip3:VCC", "bb1:tp.16", "red", [ "h-17.39", "v19.2", "h-124.5" ] ],
+    [ "chip3:A_IN", "bb1:11t.c", "blue", [ "v19.2", "h-199.79" ] ],
+    [ "chip3:SDA", "bb1:21b.f", "gold", [ "h11.41", "v48", "h-259.2" ] ],
+    [ "chip3:SCL", "bb1:20b.g", "#8f4814", [ "h21.01", "v67.2", "h-278.4" ] ],
+    [ "bb1:15b.f", "chip3:nCS", "#8f4814", [ "h0" ] ],
+    [ "bb1:16b.f", "chip3:MISO", "blue", [ "h0" ] ],
+    [ "bb1:17b.f", "chip3:MOSI", "gold", [ "h0" ] ],
+    [ "bb1:18b.g", "chip3:SCK", "orange", [ "h0" ] ]
+  ],
+  "dependencies": {}
+}
