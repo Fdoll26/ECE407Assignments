@@ -1,0 +1,16 @@
+{
+  "name": "i2cspichip",
+  "author": "Francis Doll",
+  "pins": [
+    "nCS",
+    "MISO",
+    "MOSI",
+    "SCK",
+    "GND",
+    "A_IN",
+    "VCC",
+    "SDA",
+    "SCL"
+  ],
+  "controls": []
+}

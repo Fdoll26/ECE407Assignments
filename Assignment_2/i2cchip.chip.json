@@ -1,0 +1,13 @@
+{
+  "name": "i2cchip",
+  "author": "Francis Doll",
+  "pins": [
+    "SCL",
+    "SDA",
+    "GND",
+    "A_IN",
+    "VCC",
+    ""
+  ],
+  "controls": []
+}

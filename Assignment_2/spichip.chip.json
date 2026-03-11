@@ -1,0 +1,15 @@
+{
+  "name": "spichip",
+  "author": "Francis Doll",
+  "pins": [
+    "SCK",
+    "MISO",
+    "MOSI",
+    "nCS",
+    "GND",
+    "A_IN",
+    "VCC",
+    ""
+  ],
+  "controls": []
+}
