@@ -1,0 +1,39 @@
+.program i2s_mic_rx
+; Minimal I2S mic receiver for RP2040 PIO
+;
+; Pin usage:
+;   in_base      = SD pin
+;   sideset pin 0 = SCK/BCLK
+;   set pin base = WS/LRCLK
+;
+; Notes:
+; - Assumes the mic drives valid data in the WS=0 slot.
+; - Captures one 32-bit slot, pushes it, then discards the next 32-bit slot.
+; - This is a practical starting point for INMP441-style microphones.
+; - Depending on the mic L/R selection and board wiring, you may need to invert
+;   the WS phase or shift timing by one edge.
+
+.side_set 1 opt
+
+.wrap_target
+    ; ----- LEFT / valid channel -----
+    set pins, 0      side 0     ; WS = 0
+    set x, 31        side 0     ; 32 bits
+
+left_loop:
+    nop              side 1     ; BCLK high
+    in pins, 1       side 0     ; sample 1 bit on low phase
+    jmp x-- left_loop side 0
+
+    push block       side 0     ; push 32-bit sample
+
+    ; ----- RIGHT / discard channel -----
+    set pins, 1      side 0     ; WS = 1
+    set x, 31        side 0
+
+right_loop:
+    nop              side 1
+    in null, 1       side 0     ; discard this channel
+    jmp x-- right_loop side 0
+
+.wrap

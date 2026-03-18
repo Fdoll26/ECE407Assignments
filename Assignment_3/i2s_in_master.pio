@@ -1,0 +1,100 @@
+.program i2s_in_master
+; sideset bit 0 -> SCK
+; sideset bit 1 -> WS
+.side_set 2
+
+; This program generates:
+;   - 32-bit LEFT slot  (WS = 0)
+;   - 32-bit RIGHT slot (WS = 1)
+; and shifts one SD bit into the ISR per bit clock.
+;
+; INMP441 is standard I2S:
+;   WS changes one bit clock before the MSB of the next channel.
+;
+; We sample one bit per clock during the "high" half-cycle.
+
+.wrap_target
+    ; ----------------------------
+    ; LEFT channel slot (WS = 0)
+    ; ----------------------------
+    ; Set WS low, SCK low
+    set x, 30         side 0b00
+    ; One-bit I2S delay before MSB
+    nop               side 0b01
+    nop               side 0b00
+
+left_loop:
+    in pins, 1        side 0b01   ; sample bit while SCK high
+    jmp x-- left_loop side 0b00   ; SCK low
+    in pins, 1        side 0b01   ; final (32nd) bit
+    nop               side 0b00   ; SCK low
+
+    ; -----------------------------
+    ; RIGHT channel slot (WS = 1)
+    ; -----------------------------
+    ; Set WS high, SCK low
+    set x, 30         side 0b10
+    ; One-bit I2S delay before MSB
+    nop               side 0b11
+    nop               side 0b10
+
+right_loop:
+    in pins, 1        side 0b11   ; sample bit while SCK high
+    jmp x-- right_loop side 0b10  ; SCK low
+    in pins, 1        side 0b11   ; final (32nd) bit
+    nop               side 0b10   ; SCK low
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/pio.h"
+
+static inline void i2s_in_master_program_init(
+    PIO pio,
+    uint sm,
+    uint offset,
+    uint pin_sd,
+    uint pin_sck,
+    uint sample_rate_hz
+) {
+    // pin_ws must be pin_sck + 1 because sideset uses consecutive pins
+    uint pin_ws = pin_sck + 1;
+
+    pio_sm_config c = i2s_in_master_program_get_default_config(offset);
+
+    // SD is sampled by IN PINS
+    sm_config_set_in_pins(&c, pin_sd);
+
+    // Shift right, autopush every 32 bits
+    // First received bit ends up in bit 31 of the FIFO word.
+    sm_config_set_in_shift(&c, true, true, 32);
+
+    // Join FIFOs so RX FIFO is deeper
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    // sideset base = SCK, next pin = WS
+    sm_config_set_sideset_pins(&c, pin_sck);
+
+    // Init GPIO
+    pio_gpio_init(pio, pin_sd);
+    pio_gpio_init(pio, pin_sck);
+    pio_gpio_init(pio, pin_ws);
+
+    // SD input
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_sd, 1, false);
+
+    // SCK + WS outputs
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_sck, 2, true);
+
+    // We use 2 PIO instructions per bit clock
+    // bit_clock = fs * 64 for stereo 32-bit slots
+    float bit_clock_hz = (float)sample_rate_hz * 64.0f;
+    float sm_clock_hz  = bit_clock_hz * 2.0f;
+    float div = (float)clock_get_hz(clk_sys) / sm_clock_hz;
+
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
