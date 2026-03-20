@@ -22,7 +22,6 @@
 #define STARTUP_SETTLE_MS   120u     // Allow mic to settle after clocks start
 #define PRINT_EVERY_N_BLOCKS 8u      // Reduce terminal spam
 #define FULL_SCALE_S24      8388607.0
-#define DB_OFFSET           97.0f
 
 static int32_t ping_buffer[HALF_BUFFER_SAMPLES];
 static int32_t pong_buffer[HALF_BUFFER_SAMPLES];
