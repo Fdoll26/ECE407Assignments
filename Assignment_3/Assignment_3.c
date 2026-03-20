@@ -147,14 +147,7 @@ int main(void) {
     const float sm_freq = (float)(SAMPLE_RATE_HZ * BITS_PER_CHANNEL * CHANNELS_PER_FRAME * 2u);
     const float clkdiv = (float)clock_get_hz(clk_sys) / sm_freq;
 
-    i2s_in_master_program_init(
-        pio,
-        sm,
-        offset,
-        PIN_SD,
-        PIN_SCK,
-        clkdiv
-    );
+    i2s_in_master_program_init(pio, sm, offset, PIN_SD, PIN_SCK, clkdiv);
 
     printf("\nPIO I2S input started\n");
     printf("  clk_sys     = %lu Hz\n", (unsigned long)clock_get_hz(clk_sys));
