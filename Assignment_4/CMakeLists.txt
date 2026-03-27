@@ -28,43 +28,37 @@ set(PICO_BOARD pico CACHE STRING "Board type")
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-project(Assignment_3 C CXX ASM)
+project(Assignment_4 C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(Assignment_3 Assignment_3.c )
+add_executable(Assignment_4 Assignment_4.c i2s_mic.c)
 
-pico_set_program_name(Assignment_3 "Assignment_3")
-pico_set_program_version(Assignment_3 "0.1")
+pico_generate_pio_header(Project3 ${CMAKE_CURRENT_LIST_DIR}/i2s_in_master.pio)
 
-# Generate PIO header
-# pico_generate_pio_header(Assignment_3 ${CMAKE_CURRENT_LIST_DIR}/blink.pio)
-# pico_generate_pio_header(Assignment_3 ${CMAKE_CURRENT_LIST_DIR}/mic.pio)
-pico_generate_pio_header(Assignment_3 ${CMAKE_CURRENT_LIST_DIR}/i2s_in_master.pio)
+pico_set_program_name(Assignment_4 "Assignment_4")
+pico_set_program_version(Assignment_4 "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(Assignment_3 0)
-pico_enable_stdio_usb(Assignment_3 1)
+pico_enable_stdio_uart(Assignment_4 0)
+pico_enable_stdio_usb(Assignment_4 1)
 
 # Add the standard library to the build
-target_link_libraries(Assignment_3
-        pico_stdlib)
+target_link_libraries(Assignment_4
+        m
+        pico_stdlib
+        hardware_dma
+        hardware_irq
+        hardware_pio
+        hardware_clocks)
 
 # Add the standard include files to the build
-target_include_directories(Assignment_3 PRIVATE
+target_include_directories(Assignment_4 PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
 
-# Add any user requested libraries
-target_link_libraries(Assignment_3 
-        hardware_pio
-        hardware_clocks
-        hardware_dma
-        hardware_uart
-        )
-
-pico_add_extra_outputs(Assignment_3)
+pico_add_extra_outputs(Assignment_4)
 
