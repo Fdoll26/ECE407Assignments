@@ -19,104 +19,125 @@
 #define MIC_NUM_SAMPLES     2048
 #define MIC_SAMPLE_FREQ     24000
 
-// tone reporting range:
-#define REPORT_MIN_FREQ_HZ  100
-#define REPORT_MAX_FREQ_HZ  2000
-
-// 500 Hz detection settings:
-#define TARGET_FREQ_HZ      500
-#define TARGET_TOLERANCE_HZ 40
-#define TONE_RATIO_MIN      12
-#define MIN_PEAK_AMPLITUDE  6000
+// FIR bandpass settings for a 500 Hz tone detector.
+// A 120 Hz passband is narrow enough to reject nearby content while
+// still keeping the filter short enough for real-time use.
+#define TARGET_FREQ_HZ                 500
+#define BANDPASS_LOW_HZ                440
+#define BANDPASS_HIGH_HZ               560
+#define FIR_TAP_COUNT                  81
+#define MIN_RAW_PEAK_AMPLITUDE         4000
+#define MIN_FILTERED_PEAK_AMPLITUDE    1000
+#define MIN_BAND_ENERGY_RATIO_PERMILLE 180
 
 typedef struct {
   char channel_name;
-  uint32_t frequency_hz;
-  uint64_t strongest_power;
-  uint64_t total_power;
-  int32_t peak_amplitude;
+  uint64_t raw_energy;
+  uint64_t band_energy;
+  uint32_t band_energy_ratio_permille;
+  int32_t raw_peak_amplitude;
+  int32_t filtered_peak_amplitude;
   bool tone_detected;
 } tone_result_t;
+
+static float bandpass_taps[FIR_TAP_COUNT];
 
 static int32_t extract_sample(uint32_t raw_word)
 {
   return ((int32_t) raw_word) >> 8;
 }
 
-static uint64_t goertzel_power_channel(const uint32_t *samples, size_t num_samples, size_t start_index, size_t bin_index)
+static float normalized_sinc(float x)
 {
-  size_t channel_samples = num_samples / 2;
-  float normalized = (2.0f * (float) M_PI * (float) bin_index) / (float) channel_samples;
-  float coeff = 2.0f * cosf(normalized);
-  float s_prev = 0.0f;
-  float s_prev2 = 0.0f;
+  if (fabsf(x) < 1.0e-6f) {
+    return 1.0f;
+  }
+  return sinf((float) M_PI * x) / ((float) M_PI * x);
+}
 
-  for (size_t i = start_index; i < num_samples; i += 2) {
-    float sample = (float) extract_sample(samples[i]);
-    float s = sample + (coeff * s_prev) - s_prev2;
-    s_prev2 = s_prev;
-    s_prev = s;
+static void init_bandpass_filter(void)
+{
+  const int mid = FIR_TAP_COUNT / 2;
+  const float low_cutoff = (float) BANDPASS_LOW_HZ / (float) MIC_SAMPLE_FREQ;
+  const float high_cutoff = (float) BANDPASS_HIGH_HZ / (float) MIC_SAMPLE_FREQ;
+  const float target_omega = 2.0f * (float) M_PI * ((float) TARGET_FREQ_HZ / (float) MIC_SAMPLE_FREQ);
+  float center_gain = 0.0f;
+
+  for (int tap = 0; tap < FIR_TAP_COUNT; ++tap) {
+    float offset = (float) (tap - mid);
+    float ideal = (2.0f * high_cutoff * normalized_sinc(2.0f * high_cutoff * offset)) -
+                  (2.0f * low_cutoff * normalized_sinc(2.0f * low_cutoff * offset));
+    float window = 0.54f - 0.46f * cosf((2.0f * (float) M_PI * (float) tap) / (float) (FIR_TAP_COUNT - 1));
+    bandpass_taps[tap] = ideal * window;
+    center_gain += bandpass_taps[tap] * cosf(target_omega * offset);
   }
 
-  float power = (s_prev * s_prev) + (s_prev2 * s_prev2) - (coeff * s_prev * s_prev2);
-  return (power > 0.0f) ? (uint64_t) power : 0;
+  if (fabsf(center_gain) < 1.0e-6f) {
+    return;
+  }
+
+  for (int tap = 0; tap < FIR_TAP_COUNT; ++tap) {
+    bandpass_taps[tap] /= center_gain;
+  }
 }
 
 static tone_result_t analyze_channel(const uint32_t *samples, size_t num_samples, size_t start_index, char channel_name)
 {
   size_t channel_samples = num_samples / 2;
-  size_t report_first_bin = (REPORT_MIN_FREQ_HZ * channel_samples) / MIC_SAMPLE_FREQ;
-  size_t report_last_bin = (REPORT_MAX_FREQ_HZ * channel_samples) / MIC_SAMPLE_FREQ;
-  size_t target_first_bin = ((TARGET_FREQ_HZ - TARGET_TOLERANCE_HZ) * channel_samples) / MIC_SAMPLE_FREQ;
-  size_t target_last_bin = ((TARGET_FREQ_HZ + TARGET_TOLERANCE_HZ) * channel_samples) / MIC_SAMPLE_FREQ;
-
-  tone_result_t result = {
-    .channel_name = channel_name
-  };
-  uint64_t best_target_power = 0;
-  size_t best_bin = 0;
+  int32_t history[FIR_TAP_COUNT] = {0};
+  size_t history_index = 0;
+  tone_result_t result = {.channel_name = channel_name};
 
   for (size_t i = start_index; i < num_samples; i += 2) {
     int32_t sample = extract_sample(samples[i]);
-    int32_t magnitude = (sample < 0) ? -sample : sample;
-    result.total_power += (uint64_t) magnitude * (uint64_t) magnitude;
-    if (magnitude > result.peak_amplitude) {
-      result.peak_amplitude = magnitude;
+    uint32_t magnitude = (sample < 0) ? (uint32_t) (-sample) : (uint32_t) sample;
+    float filtered_sample = 0.0f;
+    size_t tap_index;
+
+    history[history_index] = sample;
+    tap_index = history_index;
+    for (size_t tap = 0; tap < FIR_TAP_COUNT; ++tap) {
+      filtered_sample += bandpass_taps[tap] * (float) history[tap_index];
+      tap_index = (tap_index == 0) ? (FIR_TAP_COUNT - 1) : (tap_index - 1);
+    }
+    history_index = (history_index + 1) % FIR_TAP_COUNT;
+
+    int32_t filtered = (int32_t) lroundf(filtered_sample);
+    uint32_t filtered_magnitude = (filtered < 0) ? (uint32_t) (-filtered) : (uint32_t) filtered;
+
+    result.raw_energy += (uint64_t) magnitude * (uint64_t) magnitude;
+    result.band_energy += (uint64_t) filtered_magnitude * (uint64_t) filtered_magnitude;
+
+    if ((int32_t) magnitude > result.raw_peak_amplitude) {
+      result.raw_peak_amplitude = (int32_t) magnitude;
+    }
+    if ((int32_t) filtered_magnitude > result.filtered_peak_amplitude) {
+      result.filtered_peak_amplitude = (int32_t) filtered_magnitude;
     }
   }
 
-  if (channel_samples == 0 || result.total_power == 0) {
+  if (channel_samples == 0 || result.raw_energy == 0) {
     return result;
   }
 
-  for (size_t bin = report_first_bin; bin <= report_last_bin; ++bin) {
-    uint64_t power = goertzel_power_channel(samples, num_samples, start_index, bin);
-    if (power > result.strongest_power) {
-      result.strongest_power = power;
-      best_bin = bin;
-    }
-    if (bin >= target_first_bin && bin <= target_last_bin && power > best_target_power) {
-      best_target_power = power;
-    }
-  }
-
-  result.frequency_hz = (uint32_t) ((best_bin * MIC_SAMPLE_FREQ) / channel_samples);
+  result.band_energy_ratio_permille = (uint32_t) ((result.band_energy * 1000u) / result.raw_energy);
   result.tone_detected =
-      (result.peak_amplitude >= MIN_PEAK_AMPLITUDE) &&
-      (best_target_power > (uint64_t) TONE_RATIO_MIN * result.total_power);
+      (result.raw_peak_amplitude >= MIN_RAW_PEAK_AMPLITUDE) &&
+      (result.filtered_peak_amplitude >= MIN_FILTERED_PEAK_AMPLITUDE) &&
+      (result.band_energy_ratio_permille >= MIN_BAND_ENERGY_RATIO_PERMILLE);
 
   return result;
 }
 
 static const tone_result_t *pick_active_channel(const tone_result_t *left, const tone_result_t *right)
 {
-  if (left->peak_amplitude > right->peak_amplitude) {
+  if (left->filtered_peak_amplitude > right->filtered_peak_amplitude) {
     return left;
   }
-  if (right->peak_amplitude > left->peak_amplitude) {
+  if (right->filtered_peak_amplitude > left->filtered_peak_amplitude) {
     return right;
   }
-  if (left->total_power >= right->total_power) {
+  if (left->band_energy >= right->band_energy) {
     return left;
   }
   return right;
@@ -140,6 +161,7 @@ int main(void)
   }
 
   mic_i2s_start();
+  init_bandpass_filter();
   sleep_ms(250);
 
   while (1) {
@@ -149,10 +171,13 @@ int main(void)
     const tone_result_t *active = pick_active_channel(&left, &right);
 
     gpio_put(LED_PIN, left.tone_detected || right.tone_detected);
-    printf("Active channel: %c | strongest tone: %lu Hz | peak: %ld | 500 Hz match: %s\n",
+    printf("Active channel: %c | %d Hz band energy: %lu.%03lu%% | raw peak: %ld | filtered peak: %ld | match: %s\n",
            active->channel_name,
-           (unsigned long) active->frequency_hz,
-           (long) active->peak_amplitude,
+           TARGET_FREQ_HZ,
+           (unsigned long) (active->band_energy_ratio_permille / 10),
+           (unsigned long) (active->band_energy_ratio_permille % 10) * 100ul,
+           (long) active->raw_peak_amplitude,
+           (long) active->filtered_peak_amplitude,
            (left.tone_detected || right.tone_detected) ? "YES" : "NO");
   }
 }

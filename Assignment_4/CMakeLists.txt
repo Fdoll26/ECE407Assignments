@@ -37,7 +37,7 @@ pico_sdk_init()
 
 add_executable(Assignment_4 Assignment_4.c i2s_mic.c)
 
-pico_generate_pio_header(Project3 ${CMAKE_CURRENT_LIST_DIR}/i2s_in_master.pio)
+pico_generate_pio_header(Assignment_4 ${CMAKE_CURRENT_LIST_DIR}/i2s_in_master.pio)
 
 pico_set_program_name(Assignment_4 "Assignment_4")
 pico_set_program_version(Assignment_4 "0.1")
@@ -61,4 +61,3 @@ target_include_directories(Assignment_4 PRIVATE
 )
 
 pico_add_extra_outputs(Assignment_4)
-

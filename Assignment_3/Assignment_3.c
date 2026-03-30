@@ -10,10 +10,10 @@
 #include "hardware/gpio.h"
 #include "i2s_in_master.pio.h"
 
-#define PIN_SD   10   // INMP441 SD  -> Pico GPIO10 (PIO input)
-#define PIN_SCK  11   // INMP441 SCK -> Pico GPIO11 (PIO side-set pin 0)
-#define PIN_WS   12   // INMP441 WS  -> Pico GPIO12 (PIO side-set pin 1)
-#define PIN_LR   13   // INMP441 L/R select pin
+#define PIN_SD   2   // INMP441 SD  -> Pico GPIO10 (PIO input)
+#define PIN_SCK  3   // INMP441 SCK -> Pico GPIO11 (PIO side-set pin 0)
+#define PIN_WS   4   // INMP441 WS  -> Pico GPIO12 (PIO side-set pin 1)
+#define PIN_LR   5   // INMP441 L/R select pin
 
 #define SAMPLE_RATE_HZ      48000u
 #define BITS_PER_CHANNEL    32u      // 32 BCLKs per half-frame for INMP441
