@@ -35,7 +35,7 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(Assignment_4 Assignment_4.c i2s_mic.c)
+add_executable(Assignment_4 Assignment_4.c)
 
 pico_generate_pio_header(Assignment_4 ${CMAKE_CURRENT_LIST_DIR}/i2s_in_master.pio)
 

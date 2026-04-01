@@ -1,183 +1,277 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include <math.h>
 
 #include "pico/stdlib.h"
+#include "hardware/clocks.h"
+#include "hardware/pio.h"
 #include "hardware/gpio.h"
+#include "i2s_in_master.pio.h"
 
-#include "mic_i2s.h"
+#define PIN_SD   2   // INMP441 SD  -> Pico GPIO10 (PIO input)
+#define PIN_SCK  3   // INMP441 SCK -> Pico GPIO11 (PIO side-set pin 0)
+#define PIN_WS   4   // INMP441 WS  -> Pico GPIO12 (PIO side-set pin 1)
+#define PIN_LR   5   // INMP441 L/R select pin
 
-// used pins:
-#define MIC_SCK_PIN   3
-#define MIC_WS_PIN    (MIC_SCK_PIN + 1)
-#define MIC_DATA_PIN  2
-#define LED_PIN       16
+#define SAMPLE_RATE_HZ      48000u
+#define BCLKS_PER_HALF_FRAME    32u      // 32 BCLKs per half-frame for INMP441
+#define CHANNELS_PER_FRAME  2u       // I2S always clocks stereo frames
+#define HALF_BUFFER_SAMPLES 256u     // Mono samples stored per ping/pong buffer
+#define STARTUP_SETTLE_MS   120u     // Allow mic to settle after clocks start
+#define PRINT_EVERY_N_BLOCKS 8u      // Reduce terminal spam
+#define FULL_SCALE_S24      8388607.0
+#define FILTER_CENTER_HZ    500.0f
+#define FILTER_Q            12.0f
+#define DETECT_THRESHOLD_DBFS (-42.0f)
 
-// recording config:
-#define MIC_PIO_NUM         0
-#define MIC_NUM_SAMPLES     2048
-#define MIC_SAMPLE_FREQ     24000
-
-// FIR bandpass settings for a 500 Hz tone detector.
-// A 120 Hz passband is narrow enough to reject nearby content while
-// still keeping the filter short enough for real-time use.
-#define TARGET_FREQ_HZ                 500
-#define BANDPASS_LOW_HZ                440
-#define BANDPASS_HIGH_HZ               560
-#define FIR_TAP_COUNT                  81
-#define MIN_RAW_PEAK_AMPLITUDE         4000
-#define MIN_FILTERED_PEAK_AMPLITUDE    1000
-#define MIN_BAND_ENERGY_RATIO_PERMILLE 180
+static int32_t ping_buffer[HALF_BUFFER_SAMPLES];
+static int32_t pong_buffer[HALF_BUFFER_SAMPLES];
+static float filtered_buffer[HALF_BUFFER_SAMPLES];
 
 typedef struct {
-  char channel_name;
-  uint64_t raw_energy;
-  uint64_t band_energy;
-  uint32_t band_energy_ratio_permille;
-  int32_t raw_peak_amplitude;
-  int32_t filtered_peak_amplitude;
-  bool tone_detected;
-} tone_result_t;
+    float b0;
+    float b1;
+    float b2;
+    float a1;
+    float a2;
+    float x1;
+    float x2;
+    float y1;
+    float y2;
+} biquad_filter_t;
 
-static float bandpass_taps[FIR_TAP_COUNT];
+static biquad_filter_t tone_filter;
+static biquad_filter_t tone_filter2;
 
-static int32_t extract_sample(uint32_t raw_word)
-{
-  return ((int32_t) raw_word) >> 8;
-}
-
-static float normalized_sinc(float x)
-{
-  if (fabsf(x) < 1.0e-6f) {
-    return 1.0f;
-  }
-  return sinf((float) M_PI * x) / ((float) M_PI * x);
-}
-
-static void init_bandpass_filter(void)
-{
-  const int mid = FIR_TAP_COUNT / 2;
-  const float low_cutoff = (float) BANDPASS_LOW_HZ / (float) MIC_SAMPLE_FREQ;
-  const float high_cutoff = (float) BANDPASS_HIGH_HZ / (float) MIC_SAMPLE_FREQ;
-  const float target_omega = 2.0f * (float) M_PI * ((float) TARGET_FREQ_HZ / (float) MIC_SAMPLE_FREQ);
-  float center_gain = 0.0f;
-
-  for (int tap = 0; tap < FIR_TAP_COUNT; ++tap) {
-    float offset = (float) (tap - mid);
-    float ideal = (2.0f * high_cutoff * normalized_sinc(2.0f * high_cutoff * offset)) -
-                  (2.0f * low_cutoff * normalized_sinc(2.0f * low_cutoff * offset));
-    float window = 0.54f - 0.46f * cosf((2.0f * (float) M_PI * (float) tap) / (float) (FIR_TAP_COUNT - 1));
-    bandpass_taps[tap] = ideal * window;
-    center_gain += bandpass_taps[tap] * cosf(target_omega * offset);
-  }
-
-  if (fabsf(center_gain) < 1.0e-6f) {
-    return;
-  }
-
-  for (int tap = 0; tap < FIR_TAP_COUNT; ++tap) {
-    bandpass_taps[tap] /= center_gain;
-  }
-}
-
-static tone_result_t analyze_channel(const uint32_t *samples, size_t num_samples, size_t start_index, char channel_name)
-{
-  size_t channel_samples = num_samples / 2;
-  int32_t history[FIR_TAP_COUNT] = {0};
-  size_t history_index = 0;
-  tone_result_t result = {.channel_name = channel_name};
-
-  for (size_t i = start_index; i < num_samples; i += 2) {
-    int32_t sample = extract_sample(samples[i]);
-    uint32_t magnitude = (sample < 0) ? (uint32_t) (-sample) : (uint32_t) sample;
-    float filtered_sample = 0.0f;
-    size_t tap_index;
-
-    history[history_index] = sample;
-    tap_index = history_index;
-    for (size_t tap = 0; tap < FIR_TAP_COUNT; ++tap) {
-      filtered_sample += bandpass_taps[tap] * (float) history[tap_index];
-      tap_index = (tap_index == 0) ? (FIR_TAP_COUNT - 1) : (tap_index - 1);
+static void apply_biquad_block_ff(biquad_filter_t *filter, float *buf, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        const float x0 = buf[i];
+        const float y0 = filter->b0 * x0
+                       + filter->b1 * filter->x1
+                       + filter->b2 * filter->x2
+                       - filter->a1 * filter->y1
+                       - filter->a2 * filter->y2;
+        filter->x2 = filter->x1;
+        filter->x1 = x0;
+        filter->y2 = filter->y1;
+        filter->y1 = y0;
+        buf[i] = y0;
     }
-    history_index = (history_index + 1) % FIR_TAP_COUNT;
-
-    int32_t filtered = (int32_t) lroundf(filtered_sample);
-    uint32_t filtered_magnitude = (filtered < 0) ? (uint32_t) (-filtered) : (uint32_t) filtered;
-
-    result.raw_energy += (uint64_t) magnitude * (uint64_t) magnitude;
-    result.band_energy += (uint64_t) filtered_magnitude * (uint64_t) filtered_magnitude;
-
-    if ((int32_t) magnitude > result.raw_peak_amplitude) {
-      result.raw_peak_amplitude = (int32_t) magnitude;
-    }
-    if ((int32_t) filtered_magnitude > result.filtered_peak_amplitude) {
-      result.filtered_peak_amplitude = (int32_t) filtered_magnitude;
-    }
-  }
-
-  if (channel_samples == 0 || result.raw_energy == 0) {
-    return result;
-  }
-
-  result.band_energy_ratio_permille = (uint32_t) ((result.band_energy * 1000u) / result.raw_energy);
-  result.tone_detected =
-      (result.raw_peak_amplitude >= MIN_RAW_PEAK_AMPLITUDE) &&
-      (result.filtered_peak_amplitude >= MIN_FILTERED_PEAK_AMPLITUDE) &&
-      (result.band_energy_ratio_permille >= MIN_BAND_ENERGY_RATIO_PERMILLE);
-
-  return result;
 }
 
-static const tone_result_t *pick_active_channel(const tone_result_t *left, const tone_result_t *right)
-{
-  if (left->filtered_peak_amplitude > right->filtered_peak_amplitude) {
-    return left;
-  }
-  if (right->filtered_peak_amplitude > left->filtered_peak_amplitude) {
-    return right;
-  }
-  if (left->band_energy >= right->band_energy) {
-    return left;
-  }
-  return right;
+static inline int32_t inmp441_raw_to_s24(uint32_t raw_word) {
+    // PIO shifts in 32 bits per half-frame; valid 24-bit sample is in bits [31:8].
+    return ((int32_t)raw_word) >> 8;
 }
 
-int main(void)
-{
-  stdio_init_all();
-
-  gpio_init(LED_PIN);
-  gpio_set_dir(LED_PIN, GPIO_OUT);
-  gpio_put(LED_PIN, 0);
-
-  if (mic_i2s_init(MIC_PIO_NUM, MIC_DATA_PIN, MIC_SCK_PIN, MIC_SAMPLE_FREQ, MIC_NUM_SAMPLES) != 0) {
-    while (1) {
-      gpio_put(LED_PIN, 1);
-      sleep_ms(100);
-      gpio_put(LED_PIN, 0);
-      sleep_ms(100);
+static void wait_for_usb_serial(void) {
+    absolute_time_t deadline = make_timeout_time_ms(3000);
+    while (!stdio_usb_connected() && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
+        sleep_ms(10);
     }
-  }
+}
 
-  mic_i2s_start();
-  init_bandpass_filter();
-  sleep_ms(250);
+static void print_pin_summary(void) {
+    printf("INMP441 wiring:\n");
+    printf("  VDD -> 3V3\n");
+    printf("  GND -> GND\n");
+    printf("  SD  -> GPIO%d\n", PIN_SD);
+    printf("  SCK -> GPIO%d\n", PIN_SCK);
+    printf("  WS  -> GPIO%d\n", PIN_WS);
+    printf("  L/R -> GPIO%d\n", PIN_LR);
+}
 
-  while (1) {
-    uint32_t *samples = mic_i2s_get_sample_buffer(true);
-    tone_result_t left = analyze_channel(samples, MIC_NUM_SAMPLES, 0, 'L');
-    tone_result_t right = analyze_channel(samples, MIC_NUM_SAMPLES, 1, 'R');
-    const tone_result_t *active = pick_active_channel(&left, &right);
+static void configure_mic_channel(bool left_channel) {
+    gpio_init(PIN_LR);
+    gpio_set_dir(PIN_LR, GPIO_OUT);
 
-    gpio_put(LED_PIN, left.tone_detected || right.tone_detected);
-    printf("Active channel: %c | %d Hz band energy: %lu.%03lu%% | raw peak: %ld | filtered peak: %ld | match: %s\n",
-           active->channel_name,
-           TARGET_FREQ_HZ,
-           (unsigned long) (active->band_energy_ratio_permille / 10),
-           (unsigned long) (active->band_energy_ratio_permille % 10) * 100ul,
-           (long) active->raw_peak_amplitude,
-           (long) active->filtered_peak_amplitude,
-           (left.tone_detected || right.tone_detected) ? "YES" : "NO");
-  }
+    // INMP441 datasheet: L/R = 0 -> left channel, L/R = 1 -> right channel.
+    gpio_put(PIN_LR, left_channel ? 0 : 1);
+}
+
+static void fill_mono_buffer_from_pio(PIO pio, uint sm, int32_t *buffer, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        uint32_t left = pio_sm_get_blocking(pio, sm);  // left slot — mic data
+        (void)         pio_sm_get_blocking(pio, sm);   // right slot — discard
+        buffer[i] = inmp441_raw_to_s24(left);
+    }
+}
+
+static float safe_dbfs_from_amplitude(double amplitude) {
+    if (amplitude < 1.0) {
+        amplitude = 1.0;
+    }
+    return 20.0f * (float)log10(amplitude / FULL_SCALE_S24);
+}
+
+static biquad_filter_t make_bandpass_filter(float center_hz, float q_factor, float sample_rate_hz) {
+    const float omega = 2.0f * (float)M_PI * center_hz / sample_rate_hz;
+    const float alpha = sinf(omega) / (2.0f * q_factor);
+    const float cos_omega = cosf(omega);
+    const float a0 = 1.0f + alpha;
+
+    biquad_filter_t filter = {
+        .b0 = alpha / a0,
+        .b1 = 0.0f,
+        .b2 = -alpha / a0,
+        .a1 = -2.0f * cos_omega / a0,
+        .a2 = (1.0f - alpha) / a0,
+        .x1 = 0.0f,
+        .x2 = 0.0f,
+        .y1 = 0.0f,
+        .y2 = 0.0f,
+    };
+
+    return filter;
+}
+
+static void apply_biquad_block(biquad_filter_t *filter, const int32_t *input, float *output, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        const float x0 = (float)input[i];
+        const float y0 = filter->b0 * x0
+                       + filter->b1 * filter->x1
+                       + filter->b2 * filter->x2
+                       - filter->a1 * filter->y1
+                       - filter->a2 * filter->y2;
+
+        filter->x2 = filter->x1;
+        filter->x1 = x0;
+        filter->y2 = filter->y1;
+        filter->y1 = y0;
+        output[i] = y0;
+    }
+}
+
+static float rms_from_float_block(const float *buffer, size_t count) {
+    double sum_squares = 0.0;
+
+    for (size_t i = 0; i < count; ++i) {
+        sum_squares += (double)buffer[i] * (double)buffer[i];
+    }
+
+    return (float)sqrt(sum_squares / (double)count);
+}
+
+static float peak_abs_from_float_block(const float *buffer, size_t count) {
+    float peak = 0.0f;
+
+    for (size_t i = 0; i < count; ++i) {
+        float magnitude = fabsf(buffer[i]);
+        if (magnitude > peak) {
+            peak = magnitude;
+        }
+    }
+
+    return peak;
+}
+
+static void analyse_and_print_block(const int32_t *buffer, const float *filtered, size_t count, uint32_t block_index) {
+    int32_t min_value = INT32_MAX;
+    int32_t max_value = INT32_MIN;
+    int64_t sum_abs = 0;
+    double sum_squares = 0.0;
+
+    for (size_t i = 0; i < count; ++i) {
+        int32_t s = buffer[i];
+        if (s < min_value) min_value = s;
+        if (s > max_value) max_value = s;
+        sum_abs += (s < 0) ? -(int64_t)s : (int64_t)s;
+        sum_squares += (double)s * (double)s;
+    }
+
+    int32_t peak = (max_value > -min_value) ? max_value : -min_value;
+    int32_t avg_abs = (int32_t)(sum_abs / (int64_t)count);
+    double rms = sqrt(sum_squares / (double)count);
+    float peak_dbfs = safe_dbfs_from_amplitude((double)peak);
+    float rms_dbfs = safe_dbfs_from_amplitude(rms);
+    float filtered_rms = rms_from_float_block(filtered, count);
+    float filtered_peak = peak_abs_from_float_block(filtered, count);
+    float filtered_rms_dbfs = safe_dbfs_from_amplitude((double)filtered_rms);
+    float filtered_peak_dbfs = safe_dbfs_from_amplitude((double)filtered_peak);
+    float tone_margin_db = filtered_rms_dbfs - rms_dbfs;
+    // bool tone_detected = filtered_rms_dbfs > DETECT_THRESHOLD_DBFS && tone_margin_db > -6.0f;
+    bool tone_detected = filtered_rms_dbfs > DETECT_THRESHOLD_DBFS && (rms_dbfs - filtered_rms_dbfs) < 6.0f;
+
+    uint bar_len = 0;
+    if (filtered_rms_dbfs > -60.0f) {
+        bar_len = (uint)(((filtered_rms_dbfs + 60.0f) / 60.0f) * 40.0f);
+        if (bar_len > 40u) {
+            bar_len = 40u;
+        }
+    }
+
+    printf("block %lu  raw_rms=%.1f dBFS  500Hz_rms=%.1f dBFS  500Hz_peak=%.1f dBFS  [%s] [",
+           (unsigned long)block_index, rms_dbfs, filtered_rms_dbfs, filtered_peak_dbfs, tone_detected ? "TONE" : "----");
+
+    for (uint i = 0; i < bar_len; ++i) {
+        putchar('#');
+    }
+    for (uint i = bar_len; i < 40u; ++i) {
+        putchar(' ');
+    }
+    printf("]\n");
+
+    printf("  min=%ld  max=%ld  avg|x|=%ld  raw_peak=%.1f dBFS  band_delta=%.1f dB\n",
+           (long)min_value, (long)max_value, (long)avg_abs, peak_dbfs, tone_margin_db);
+}
+
+int main(void) {
+    stdio_init_all();
+    wait_for_usb_serial();
+    sleep_ms(250);
+
+    print_pin_summary();
+    configure_mic_channel(true);   // mono: microphone drives the left slot only
+
+    PIO pio = pio0;
+    uint sm = 0;
+    uint offset = pio_add_program(pio, &i2s_in_master_program);
+    tone_filter = make_bandpass_filter(FILTER_CENTER_HZ, FILTER_Q, (float)SAMPLE_RATE_HZ);
+    tone_filter2 = make_bandpass_filter(FILTER_CENTER_HZ, FILTER_Q, (float)SAMPLE_RATE_HZ);
+
+    // Each stereo frame requires 64 BCLKs, and the PIO uses 2 instructions per BCLK.
+    // Therefore the state machine must run at SAMPLE_RATE * 64 * 2 instructions per second.
+    const float sm_freq = (float)(SAMPLE_RATE_HZ * BCLKS_PER_HALF_FRAME * CHANNELS_PER_FRAME * 2u);
+    const float clkdiv = (float)clock_get_hz(clk_sys) / sm_freq;
+
+    // i2s_in_master_program_init(pio, sm, offset, SAMPLE_RATE_HZ, PIN_SD, PIN_SCK);
+    i2s_in_master_program_init(pio, sm, offset, clkdiv, PIN_SD, PIN_SCK);
+    pio_sm_set_enabled(pio, sm, true);
+
+    printf("\nPIO I2S input started\n");
+    printf("  clk_sys     = %lu Hz\n", (unsigned long)clock_get_hz(clk_sys));
+    printf("  sample rate = %u Hz\n", SAMPLE_RATE_HZ);
+    printf("  sm clkdiv   = %.6f\n", clkdiv);
+    printf("  band-pass   = %.1f Hz (Q=%.1f)\n", FILTER_CENTER_HZ, FILTER_Q);
+    printf("  printing    = every %u blocks\n", PRINT_EVERY_N_BLOCKS);
+    printf("  Present a steady 500 Hz tone to the microphone.\n\n");
+
+    sleep_ms(STARTUP_SETTLE_MS);
+
+    // Flush a few initial words because the mic outputs zeros right after startup.
+    for (uint i = 0; i < 16; ++i) {          // 16 pairs = 32 words, stays in sync
+      (void)pio_sm_get_blocking(pio, sm);   // left
+      (void)pio_sm_get_blocking(pio, sm);   // right
+    }
+
+    uint32_t block_index = 0;
+    while (true) {
+        int32_t *active = (block_index & 1u) ? pong_buffer : ping_buffer;
+        memset(active, 0, HALF_BUFFER_SAMPLES * sizeof(active[0]));
+
+        fill_mono_buffer_from_pio(pio, sm, active, HALF_BUFFER_SAMPLES);
+        // apply_biquad_block(&tone_filter, active, filtered_buffer, HALF_BUFFER_SAMPLES);
+        apply_biquad_block(&tone_filter, active, filtered_buffer, HALF_BUFFER_SAMPLES);
+        apply_biquad_block_ff(&tone_filter2, filtered_buffer, HALF_BUFFER_SAMPLES);
+
+        if ((block_index % PRINT_EVERY_N_BLOCKS) == 0u) {
+            analyse_and_print_block(active, filtered_buffer, HALF_BUFFER_SAMPLES, block_index);
+        }
+
+        ++block_index;
+    }
+
+    return 0;
 }
