@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
@@ -10,54 +11,99 @@
 #include "hardware/gpio.h"
 #include "i2s_in_master.pio.h"
 
-#define PIN_SD   2   // INMP441 SD  -> Pico GPIO10 (PIO input)
-#define PIN_SCK  3   // INMP441 SCK -> Pico GPIO11 (PIO side-set pin 0)
-#define PIN_WS   4   // INMP441 WS  -> Pico GPIO12 (PIO side-set pin 1)
-#define PIN_LR   5   // INMP441 L/R select pin
+#define PIN_SD   2
+#define PIN_SCK  3 
+#define PIN_WS   4 
+#define PIN_LR   5
 
 #define SAMPLE_RATE_HZ      48000u
-#define BCLKS_PER_HALF_FRAME    32u      // 32 BCLKs per half-frame for INMP441
-#define CHANNELS_PER_FRAME  2u       // I2S always clocks stereo frames
-#define HALF_BUFFER_SAMPLES 256u     // Mono samples stored per ping/pong buffer
-#define STARTUP_SETTLE_MS   120u     // Allow mic to settle after clocks start
-#define PRINT_EVERY_N_BLOCKS 8u      // Reduce terminal spam
+#define BCLKS_PER_HALF_FRAME    32u 
+#define CHANNELS_PER_FRAME  2u
+#define HALF_BUFFER_SAMPLES 256u
+#define STARTUP_SETTLE_MS   120u
+#define PRINT_EVERY_N_BLOCKS 8u 
 #define FULL_SCALE_S24      8388607.0
 #define FILTER_CENTER_HZ    500.0f
 #define FILTER_Q            12.0f
-#define DETECT_THRESHOLD_DBFS (-42.0f)
+#define FILTER_HALF_BANDWIDTH_HZ 30.0f
+// #define DETECT_THRESHOLD_DBFS (-42.0f)
+#define DETECT_THRESHOLD_DBFS (-55.0f)
+// #define FIR_LENGTH 65u
+#define FIR_LENGTH 129u
 
 static int32_t ping_buffer[HALF_BUFFER_SAMPLES];
 static int32_t pong_buffer[HALF_BUFFER_SAMPLES];
-static float filtered_buffer[HALF_BUFFER_SAMPLES];
+// static float filtered_buffer[HALF_BUFFER_SAMPLES];
+static double filtered_buffer[HALF_BUFFER_SAMPLES];
 
 typedef struct {
-    float b0;
-    float b1;
-    float b2;
-    float a1;
-    float a2;
-    float x1;
-    float x2;
-    float y1;
-    float y2;
-} biquad_filter_t;
+    int samplecount;
+    int length;
+    double *fircoeff;
+    int32_t *history;
+} fir_filter_t;
 
-static biquad_filter_t tone_filter;
-static biquad_filter_t tone_filter2;
+static double sinc(const double x)
+{
+    if (x == 0)
+        return 1;
+    return sin(M_PI * x) / (M_PI * x);
+}
 
-static void apply_biquad_block_ff(biquad_filter_t *filter, float *buf, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        const float x0 = buf[i];
-        const float y0 = filter->b0 * x0
-                       + filter->b1 * filter->x1
-                       + filter->b2 * filter->x2
-                       - filter->a1 * filter->y1
-                       - filter->a2 * filter->y2;
-        filter->x2 = filter->x1;
-        filter->x1 = x0;
-        filter->y2 = filter->y1;
-        filter->y1 = y0;
-        buf[i] = y0;
+static fir_filter_t make_fir_filter(int length, double middle, double offset, bool win_on){
+    double *rep_fircoeff = (double*) malloc(length * sizeof(double));
+    int32_t *rep_history = (int32_t*)calloc((size_t)(length - 1), sizeof(int32_t));
+    double f1 = (middle - offset) / (double)SAMPLE_RATE_HZ;
+    double f2 = (middle + offset) / (double)SAMPLE_RATE_HZ;
+
+
+    for(int i = 0; i < length; i++) {
+        // int temp = i - int(length/2);
+        int temp = i - length/2;
+        // rep_fircoeff[i] = 2.0*f1*sinc(2.0*f1*temp) - 2.0*f2*sinc(2.0*f2*temp);
+        rep_fircoeff[i] = 2.0*f2*sinc(2.0*f2*temp) - 2.0*f1*sinc(2.0*f1*temp);
+        if(win_on){
+            double alpha = 0.54;
+            double beta = 0.46;
+            double hamming = alpha - beta * cos(2.0 * M_PI * i / (length - 1));
+            double hanning = sin(((double) M_PI * i) / (length - 1)) * sin(((double) M_PI * i) / (length - 1));
+            // double triangle = 1 - fabs((i - (((double)(length-1)) / 2.0)) / (((double)length) / 2.0));
+            double alpha0 = 0.42;
+            double alpha1 = 0.5;
+            double alpha2 = 0.08;
+            double blackman = alpha0 - alpha1 * cos(2.0 * M_PI * i / (length - 1)) - alpha2 * cos(4.0 * M_PI * i / (length - 1));
+            // rep_fircoeff[i] = rep_fircoeff[i] * hanning;
+            rep_fircoeff[i] = rep_fircoeff[i] * blackman;
+        }
+    }
+
+    fir_filter_t new_filter = {
+        .samplecount = HALF_BUFFER_SAMPLES,
+        .length = length,
+        .fircoeff = rep_fircoeff,
+        .history = rep_history,
+    };
+
+    return new_filter;
+}
+
+static void apply_fir_filter(fir_filter_t *filter, const int32_t *input, double *output) {
+    for (int idx = 0; idx < filter->samplecount; ++idx) {
+        double acc = 0.0;
+        for (int i = 0; i < filter->length; ++i) {
+            int sample_idx = idx - i;
+            if (sample_idx >= 0) {
+                acc += (double)input[sample_idx] * filter->fircoeff[i];
+            } else {
+                int history_idx = filter->length - 2 + sample_idx;
+                acc += (double)filter->history[history_idx] * filter->fircoeff[i];
+            }
+        }
+        output[idx] = acc;
+    }
+
+    for (int i = 0; i < filter->length - 1; ++i) {
+        filter->history[i] = input[filter->samplecount - (filter->length - 1) + i];
     }
 }
 
@@ -94,7 +140,7 @@ static void configure_mic_channel(bool left_channel) {
 static void fill_mono_buffer_from_pio(PIO pio, uint sm, int32_t *buffer, size_t count) {
     for (size_t i = 0; i < count; i++) {
         uint32_t left = pio_sm_get_blocking(pio, sm);  // left slot — mic data
-        (void)         pio_sm_get_blocking(pio, sm);   // right slot — discard
+        (void) pio_sm_get_blocking(pio, sm);   // right slot — discard
         buffer[i] = inmp441_raw_to_s24(left);
     }
 }
@@ -106,59 +152,22 @@ static float safe_dbfs_from_amplitude(double amplitude) {
     return 20.0f * (float)log10(amplitude / FULL_SCALE_S24);
 }
 
-static biquad_filter_t make_bandpass_filter(float center_hz, float q_factor, float sample_rate_hz) {
-    const float omega = 2.0f * (float)M_PI * center_hz / sample_rate_hz;
-    const float alpha = sinf(omega) / (2.0f * q_factor);
-    const float cos_omega = cosf(omega);
-    const float a0 = 1.0f + alpha;
-
-    biquad_filter_t filter = {
-        .b0 = alpha / a0,
-        .b1 = 0.0f,
-        .b2 = -alpha / a0,
-        .a1 = -2.0f * cos_omega / a0,
-        .a2 = (1.0f - alpha) / a0,
-        .x1 = 0.0f,
-        .x2 = 0.0f,
-        .y1 = 0.0f,
-        .y2 = 0.0f,
-    };
-
-    return filter;
-}
-
-static void apply_biquad_block(biquad_filter_t *filter, const int32_t *input, float *output, size_t count) {
-    for (size_t i = 0; i < count; ++i) {
-        const float x0 = (float)input[i];
-        const float y0 = filter->b0 * x0
-                       + filter->b1 * filter->x1
-                       + filter->b2 * filter->x2
-                       - filter->a1 * filter->y1
-                       - filter->a2 * filter->y2;
-
-        filter->x2 = filter->x1;
-        filter->x1 = x0;
-        filter->y2 = filter->y1;
-        filter->y1 = y0;
-        output[i] = y0;
-    }
-}
-
-static float rms_from_float_block(const float *buffer, size_t count) {
+static double rms_from_float_block(const double *buffer, size_t count) {
     double sum_squares = 0.0;
 
     for (size_t i = 0; i < count; ++i) {
-        sum_squares += (double)buffer[i] * (double)buffer[i];
+        sum_squares += buffer[i] * buffer[i];
     }
 
-    return (float)sqrt(sum_squares / (double)count);
+    return sqrt(sum_squares / (double)count);
 }
 
-static float peak_abs_from_float_block(const float *buffer, size_t count) {
-    float peak = 0.0f;
+static double peak_abs_from_float_block(const double *buffer, size_t count) {
+    double peak = 0.0f;
 
     for (size_t i = 0; i < count; ++i) {
-        float magnitude = fabsf(buffer[i]);
+        // double magnitude = fabsf(buffer[i]);
+        double magnitude = fabs(buffer[i]);
         if (magnitude > peak) {
             peak = magnitude;
         }
@@ -167,10 +176,11 @@ static float peak_abs_from_float_block(const float *buffer, size_t count) {
     return peak;
 }
 
-static void analyse_and_print_block(const int32_t *buffer, const float *filtered, size_t count, uint32_t block_index) {
+static void analyse_and_print_block(const int32_t *buffer, const double *filtered, size_t count, uint32_t block_index) {
     int32_t min_value = INT32_MAX;
     int32_t max_value = INT32_MIN;
     int64_t sum_abs = 0;
+    int64_t sum_samples = 0;
     double sum_squares = 0.0;
 
     for (size_t i = 0; i < count; ++i) {
@@ -178,21 +188,34 @@ static void analyse_and_print_block(const int32_t *buffer, const float *filtered
         if (s < min_value) min_value = s;
         if (s > max_value) max_value = s;
         sum_abs += (s < 0) ? -(int64_t)s : (int64_t)s;
-        sum_squares += (double)s * (double)s;
+        sum_samples += s;
     }
 
-    int32_t peak = (max_value > -min_value) ? max_value : -min_value;
+    const double mean = (double)sum_samples / (double)count;
+    double dc_removed_peak = 0.0;
+    sum_abs = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        double centered = (double)buffer[i] - mean;
+        double magnitude = fabs(centered);
+        sum_abs += (int64_t)magnitude;
+        sum_squares += centered * centered;
+        if (magnitude > dc_removed_peak) {
+            dc_removed_peak = magnitude;
+        }
+    }
+
     int32_t avg_abs = (int32_t)(sum_abs / (int64_t)count);
     double rms = sqrt(sum_squares / (double)count);
-    float peak_dbfs = safe_dbfs_from_amplitude((double)peak);
-    float rms_dbfs = safe_dbfs_from_amplitude(rms);
-    float filtered_rms = rms_from_float_block(filtered, count);
-    float filtered_peak = peak_abs_from_float_block(filtered, count);
-    float filtered_rms_dbfs = safe_dbfs_from_amplitude((double)filtered_rms);
-    float filtered_peak_dbfs = safe_dbfs_from_amplitude((double)filtered_peak);
-    float tone_margin_db = filtered_rms_dbfs - rms_dbfs;
+    double peak_dbfs = safe_dbfs_from_amplitude(dc_removed_peak);
+    double rms_dbfs = safe_dbfs_from_amplitude(rms);
+    double filtered_rms = rms_from_float_block(filtered, count);
+    double filtered_peak = peak_abs_from_float_block(filtered, count);
+    double filtered_rms_dbfs = safe_dbfs_from_amplitude(filtered_rms);
+    double filtered_peak_dbfs = safe_dbfs_from_amplitude(filtered_peak);
+    double tone_margin_db = filtered_rms_dbfs - rms_dbfs;
     // bool tone_detected = filtered_rms_dbfs > DETECT_THRESHOLD_DBFS && tone_margin_db > -6.0f;
-    bool tone_detected = filtered_rms_dbfs > DETECT_THRESHOLD_DBFS && (rms_dbfs - filtered_rms_dbfs) < 6.0f;
+    bool tone_detected = filtered_rms_dbfs > DETECT_THRESHOLD_DBFS && (rms_dbfs - filtered_rms_dbfs) < 10.0f;
 
     uint bar_len = 0;
     if (filtered_rms_dbfs > -60.0f) {
@@ -223,16 +246,12 @@ int main(void) {
     sleep_ms(250);
 
     print_pin_summary();
-    configure_mic_channel(true);   // mono: microphone drives the left slot only
+    configure_mic_channel(true);
 
     PIO pio = pio0;
     uint sm = 0;
     uint offset = pio_add_program(pio, &i2s_in_master_program);
-    tone_filter = make_bandpass_filter(FILTER_CENTER_HZ, FILTER_Q, (float)SAMPLE_RATE_HZ);
-    tone_filter2 = make_bandpass_filter(FILTER_CENTER_HZ, FILTER_Q, (float)SAMPLE_RATE_HZ);
-
-    // Each stereo frame requires 64 BCLKs, and the PIO uses 2 instructions per BCLK.
-    // Therefore the state machine must run at SAMPLE_RATE * 64 * 2 instructions per second.
+    fir_filter_t firfilter = make_fir_filter(FIR_LENGTH, FILTER_CENTER_HZ, FILTER_HALF_BANDWIDTH_HZ, true);
     const float sm_freq = (float)(SAMPLE_RATE_HZ * BCLKS_PER_HALF_FRAME * CHANNELS_PER_FRAME * 2u);
     const float clkdiv = (float)clock_get_hz(clk_sys) / sm_freq;
 
@@ -244,16 +263,17 @@ int main(void) {
     printf("  clk_sys     = %lu Hz\n", (unsigned long)clock_get_hz(clk_sys));
     printf("  sample rate = %u Hz\n", SAMPLE_RATE_HZ);
     printf("  sm clkdiv   = %.6f\n", clkdiv);
-    printf("  band-pass   = %.1f Hz (Q=%.1f)\n", FILTER_CENTER_HZ, FILTER_Q);
+    // printf("  band-pass   = %.1f Hz (Q=%.1f)\n", FILTER_CENTER_HZ, FILTER_Q);
+    printf("  band-pass   = %.1f +/- %.1f Hz  FIR taps=%d\n", FILTER_CENTER_HZ, FILTER_HALF_BANDWIDTH_HZ, FIR_LENGTH);
     printf("  printing    = every %u blocks\n", PRINT_EVERY_N_BLOCKS);
     printf("  Present a steady 500 Hz tone to the microphone.\n\n");
 
     sleep_ms(STARTUP_SETTLE_MS);
 
     // Flush a few initial words because the mic outputs zeros right after startup.
-    for (uint i = 0; i < 16; ++i) {          // 16 pairs = 32 words, stays in sync
-      (void)pio_sm_get_blocking(pio, sm);   // left
-      (void)pio_sm_get_blocking(pio, sm);   // right
+    for (uint i = 0; i < 16; ++i) { 
+      (void)pio_sm_get_blocking(pio, sm); 
+      (void)pio_sm_get_blocking(pio, sm);
     }
 
     uint32_t block_index = 0;
@@ -262,9 +282,7 @@ int main(void) {
         memset(active, 0, HALF_BUFFER_SAMPLES * sizeof(active[0]));
 
         fill_mono_buffer_from_pio(pio, sm, active, HALF_BUFFER_SAMPLES);
-        // apply_biquad_block(&tone_filter, active, filtered_buffer, HALF_BUFFER_SAMPLES);
-        apply_biquad_block(&tone_filter, active, filtered_buffer, HALF_BUFFER_SAMPLES);
-        apply_biquad_block_ff(&tone_filter2, filtered_buffer, HALF_BUFFER_SAMPLES);
+        apply_fir_filter(&firfilter, active, filtered_buffer);
 
         if ((block_index % PRINT_EVERY_N_BLOCKS) == 0u) {
             analyse_and_print_block(active, filtered_buffer, HALF_BUFFER_SAMPLES, block_index);
@@ -272,6 +290,6 @@ int main(void) {
 
         ++block_index;
     }
-
+    
     return 0;
 }
